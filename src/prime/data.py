@@ -179,6 +179,7 @@ def fetch_new_clients(report_date: str) -> pd.DataFrame:
         FROM prime.clients
         WHERE {base_filter}
           AND CAST(registered_at AS DATE) = CAST(:date AS DATE)
+        GROUP BY CAST(registered_at AS DATE)
     """)
     
     logger.info(f"Загрузка новых клиентов за дату: {report_date}")
