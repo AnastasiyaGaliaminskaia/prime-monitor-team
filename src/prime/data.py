@@ -222,3 +222,49 @@ def fetch_daily_payments_by_method(report_date: str) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"Ошибка при загрузке платежей по методам за {report_date}: {e}")
         raise
+
+
+
+import requests
+
+def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
+    """
+    Загружает курс доллара к рублю от ЦБ РФ на конкретную дату.
+    Возвращает DataFrame с колонками: date, currency, rate.
+    Если API недоступен, возвращает пустой DataFrame и пишет ошибку в лог.
+    """
+    # Формат даты для API ЦБ РФ: YYYY/MM/DD
+    url = f"https://www.cbr-xml-daily.ru/archive/{report_date.replace('-', '/')}/daily_json.js"
+    
+    logger.info(f"Запрос курса валют ЦБ РФ на дату: {report_date}")
+    
+    try:
+        # Обязательно ставим timeout, чтобы система не зависла, если API упадет!
+        response = requests.get(url, timeout=10)
+        response.raise_for_status() # Вызовет ошибку, если статус 404 или 500
+        
+        data = response.json()
+        
+        # Достаем курс USD (доллара)
+        usd_data = data['Valute'].get('USD')
+        if not usd_data:
+            logger.warning(f"Данные по USD не найдены в ответе API за {report_date}")
+            return pd.DataFrame()
+            
+        # В ответе ЦБ курс умножен на номинал (обычно на 1, но бывает и на 10)
+        nominal = usd_data['Nominal']
+        rate = usd_data['Value'] / nominal
+        
+        df = pd.DataFrame([{
+            "date": report_date,
+            "currency": "USD",
+            "rate": rate
+        }])
+        
+        logger.info(f"Успешно получен курс USD: {rate}")
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        # Если интернета нет или API упал — просто пишем в лог и возвращаем пустоту
+        logger.error(f"Не удалось получить данные от ЦБ РФ за {report_date}: {e}")
+        return pd.DataFrame()
