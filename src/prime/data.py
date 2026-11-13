@@ -2,6 +2,7 @@ import logging
 import pandas as pd
 from sqlalchemy import text
 from .config import get_engine
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -268,3 +269,50 @@ def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
         # Если интернета нет или API упал — просто пишем в лог и возвращаем пустоту
         logger.error(f"Не удалось получить данные от ЦБ РФ за {report_date}: {e}")
         return pd.DataFrame()
+
+def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, **kwargs) -> pd.DataFrame:
+    """
+    Универсальная функция-обертка для кэширования.
+    Если файл есть — читает его. Если нет — вызывает fetch_func и сохраняет.
+    """
+    # Формируем путь: data/revenue_2026-08-03.parquet
+    file_path = f"data/{metric_name}_{report_date}.parquet"
+    
+    # 1. Проверяем кэш
+    if os.path.exists(file_path):
+        logger.info(f"[КЭШ] Чтение {metric_name} за {report_date} из файла")
+        return pd.read_parquet(file_path)
+        
+    # 2. Если файла нет, идем в базу
+    logger.info(f"[БАЗА] Файл кэша для {metric_name} за {report_date} не найден. Загружаем...")
+    df = fetch_func(report_date, **kwargs)
+    
+    # 3. Сохраняем в кэш
+    os.makedirs("data", exist_ok=True) # Создаем папку, если её нет
+    df.to_parquet(file_path, index=False)
+    logger.info(f"[КЭШ] Данные сохранены в {file_path}")
+    
+    return df
+
+
+
+
+#Андрей, это тебе
+
+def get_daily_revenue_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "revenue", fetch_daily_revenue)
+
+def get_active_subscriptions_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "active_subs", fetch_active_subscriptions)
+
+def get_churn_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "churn", fetch_churn)
+
+def get_new_clients_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "new_clients", fetch_new_clients)
+    
+def get_sessions_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "sessions", fetch_daily_sessions)
+
+def get_cbr_rate_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(report_date, "cbr_rate", fetch_cbr_currency_rate)
