@@ -1,3 +1,4 @@
+from datetime import date
 import logging
 import os
 import uuid
@@ -8,7 +9,8 @@ import requests
 from sqlalchemy import text
 
 from .config import get_engine
-
+from .market_data import load_cbr_rate
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -181,45 +183,20 @@ def fetch_daily_payments_by_method(report_date: str) -> pd.DataFrame:
 
 
 def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
-    """
-    Загружает курс USD к RUB на историческую дату из API ЦБ.
-    При недоступности API возвращает пустой DataFrame.
-    """
-    url = (
-        "https://www.cbr-xml-daily.ru/archive/"
-        f"{report_date.replace('-', '/')}/daily_json.js"
-    )
-    logger.info("Запрос курса ЦБ РФ на %s", report_date)
-
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        usd_data = data.get("Valute", {}).get("USD")
-        if not usd_data:
-            logger.warning("USD не найден в ответе ЦБ за %s", report_date)
-            return pd.DataFrame()
-
-        rate = usd_data["Value"] / usd_data["Nominal"]
-        return pd.DataFrame(
-            [{
-                "date": report_date,
-                "currency": "USD",
-                "rate": rate,
-            }]
-        )
-    except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
-        logger.error("Не удалось получить курс ЦБ за %s: %s", report_date, exc)
-        return pd.DataFrame()
+    """Исторический USD/RUB через официальный API Банка России."""
+    columns = ["date", "currency", "rate", "effective_date"]
+    rate = load_cbr_rate(date.fromisoformat(report_date))
+    if rate is None:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame([{
+        "date": report_date,
+        "currency": "USD",
+        "rate": rate.rubles_per_usd,
+        "effective_date": rate.effective_date.isoformat(),
+    }], columns=columns)
 
 
-def _get_cached_or_fetch(
-    report_date: str,
-    metric_name: str,
-    fetch_func,
-    **kwargs,
-) -> pd.DataFrame:
+def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, *, cache_empty=True, **kwargs) -> pd.DataFrame:
     """
     Читает или создаёт дневной Parquet-кеш.
 
@@ -238,10 +215,15 @@ def _get_cached_or_fetch(
 
     logger.info("[DB] Загрузка %s за %s", metric_name, report_date)
     df = fetch_func(report_date, **kwargs)
-
+    if df.empty and not cache_empty:
+        return df
+    
+    # 3. Сохраняем в кэш
     temp_path = CACHE_DIR / (
-        f".{CACHE_VERSION}_{metric_name}_{report_date}_{uuid.uuid4().hex}.tmp.parquet"
+        f".{CACHE_VERSION}_{metric_name}_{report_date}_"
+        f"{uuid.uuid4().hex}.tmp.parquet"
     )
+
     try:
         df.to_parquet(temp_path, index=False)
         os.replace(temp_path, file_path)
@@ -250,8 +232,8 @@ def _get_cached_or_fetch(
             temp_path.unlink()
 
     logger.info("[CACHE] Сохранено %s", file_path)
-    return df
 
+    return df
 
 # Публичные функции кеширования — сохраняют привычные имена,
 # чтобы не пришлось менять импорты в остальных модулях проекта.
@@ -293,7 +275,4 @@ def get_daily_payments_by_method_cached(report_date: str) -> pd.DataFrame:
 
 
 def get_cbr_rate_cached(report_date: str) -> pd.DataFrame:
-    return _get_cached_or_fetch(
-        report_date, "cbr_rate", fetch_cbr_currency_rate
-    )
-
+    return _get_cached_or_fetch(report_date, "cbr_official_rate", fetch_cbr_currency_rate, cache_empty=False)

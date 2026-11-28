@@ -46,3 +46,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Журнал командного отчёта
+/logs/prime.log

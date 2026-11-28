@@ -7,6 +7,7 @@
 """
 
 import os
+from datetime import date
 
 from dotenv import find_dotenv, load_dotenv
 from sqlalchemy import Engine, create_engine
@@ -29,3 +30,9 @@ def get_engine() -> Engine:
         )
 
     return create_engine(dsn)
+
+
+def load_replay_start() -> date:
+    """Прочитать первую дату отчёта для replay."""
+    load_dotenv(find_dotenv(usecwd=True))
+    return date.fromisoformat(os.getenv("PRIME_REPLAY_START", "2026-08-20"))
