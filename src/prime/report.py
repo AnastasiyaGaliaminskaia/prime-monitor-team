@@ -3,8 +3,11 @@
 import logging
 from datetime import date, timedelta
 
-from .analytics_data import AFTER_LAST_DAY, FIRST_DAY, load_churn_cohorts, load_daily
-from .factors import weekly_revenue_factors
+import pandas as pd
+
+from .alerts import LOOKBACK_WEEKS, RULES, alert_details, detect_anomalies, update_incidents
+from .analytics_data import AFTER_LAST_DAY, FIRST_DAY, load_churn_cohorts, load_daily, load_payment_channels
+from .factors import channel_revenue_factors, weekly_revenue_factors
 from .market_data import load_cbr_rate, load_imoex
 from .metrics import period_metrics
 
@@ -38,39 +41,106 @@ REASONS = {
 }
 
 
-def build_day(report_date: date) -> dict:
-    """Собрать метрики за вчера, семь дней и разложение к предыдущей неделе UTC."""
-    if not FIRST_DAY < report_date <= AFTER_LAST_DAY:
-        raise ValueError(
+class ReportDateError(ValueError):
+    """Запрошена дата вне доступного периода."""
+
+
+def validate_report_range(start: date, end: date) -> None:
+    if start > end:
+        raise ReportDateError("Начало периода должно быть не позже конца")
+    if not FIRST_DAY < start <= end <= AFTER_LAST_DAY:
+        raise ReportDateError(
             f"Дата отчёта вне диапазона {(FIRST_DAY + timedelta(days=1)):%d.%m.%Y}"
             f"–{AFTER_LAST_DAY:%d.%m.%Y}"
         )
 
-    day = report_date - timedelta(days=1)
-    week_start = report_date - timedelta(days=7)
-    load_start = max(FIRST_DAY, report_date - timedelta(days=14))
-    daily, _ = load_daily(load_start, report_date, subscriptions=True)
-    periods = [(start, report_date) for start in (day, week_start) if start >= FIRST_DAY]
-    cohorts = load_churn_cohorts(periods)
-    row = {
-        "report_date": report_date,
-        "day": day,
-        "week_start": week_start,
-        "day_metrics": period_metrics(
-            daily, day, report_date, churn_cohort=cohorts.get((day, report_date))
-        ),
-        "week_metrics": period_metrics(
-            daily, week_start, report_date, churn_cohort=cohorts.get((week_start, report_date))
-        ),
-        "factors": weekly_revenue_factors(daily, report_date),
-        "cbr_rate": load_cbr_rate(report_date),
-        "imoex": load_imoex(report_date),
-    }
-    log.info("Отчёт за %s рассчитан по %d дням витрины", report_date, len(daily))
-    for section in ("day_metrics", "week_metrics", "factors"):
-        if row[section]["issues"]:
-            log.warning("Отчёт за %s, %s: %s", report_date, section, row[section]["issues"])
+
+def build_day(report_date: date) -> dict:
+    """Собрать отчёт за одну дату без записи состояния."""
+    row, _ = next(iter_reports(report_date, report_date))
     return row
+
+
+def _incidents_before(daily: pd.DataFrame, start: date, end: date) -> set[str]:
+    """Найти последнее подтверждённое состояние каждого правила до end."""
+    open_incidents = set()
+    unresolved = set(RULES)
+    while unresolved:
+        day = end - timedelta(days=1)
+        while unresolved and day >= start:
+            assessments = detect_anomalies(daily, day)
+            for metric in tuple(unresolved):
+                status = assessments[metric]["status"]
+                if status in ("normal", "anomaly"):
+                    unresolved.remove(metric)
+                    if status == "anomaly":
+                        open_incidents.add(metric)
+            day -= timedelta(days=1)
+        if not unresolved or start == FIRST_DAY:
+            break
+        end = start
+        start = max(FIRST_DAY, end - timedelta(weeks=4))
+        history_start = max(FIRST_DAY, start - timedelta(weeks=LOOKBACK_WEEKS))
+        daily, _ = load_daily(history_start, end, subscriptions=True)
+    return open_incidents
+
+
+def iter_reports(start: date, end: date, *, open_incidents: set[str] | None = None):
+    """Считать отчёты по датам включительно, загружая витрину за диапазон один раз."""
+    validate_report_range(start, end)
+    first_event_day = start - timedelta(days=1)
+    # Начинаем с ближайших двух недель и при пропусках смотрим дальше назад.
+    evaluation_start = max(FIRST_DAY, first_event_day - timedelta(weeks=2))
+    if open_incidents is not None:
+        evaluation_start = first_event_day
+    load_start = max(FIRST_DAY, evaluation_start - timedelta(weeks=LOOKBACK_WEEKS))
+    daily, channels = load_daily(load_start, end, subscriptions=True)
+    payments_by_channel = load_payment_channels(max(FIRST_DAY, start - timedelta(days=14)), end)
+    dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    periods = list(dict.fromkeys(
+        (report_date - timedelta(days=length), report_date)
+        for report_date in dates
+        for length in (1, 7)
+        if report_date - timedelta(days=length) >= FIRST_DAY
+    ))
+    cohorts = load_churn_cohorts(periods)
+
+    incidents = (
+        _incidents_before(daily, evaluation_start, first_event_day)
+        if open_incidents is None else open_incidents
+    )
+
+    for report_date in dates:
+        day = report_date - timedelta(days=1)
+        week_start = report_date - timedelta(days=7)
+        assessments = detect_anomalies(daily, day)
+        incidents, new = update_incidents(assessments, incidents)
+        factors = weekly_revenue_factors(daily, report_date)
+        by_channel = channel_revenue_factors(payments_by_channel, factors)
+        row = {
+            "report_date": report_date,
+            "day": day,
+            "week_start": week_start,
+            "day_metrics": period_metrics(
+                daily, day, report_date, churn_cohort=cohorts.get((day, report_date))
+            ),
+            "week_metrics": period_metrics(
+                daily, week_start, report_date, churn_cohort=cohorts.get((week_start, report_date))
+            ),
+            "factors": factors,
+            "channel_factors": by_channel,
+            "cbr_rate": load_cbr_rate(report_date),
+            "imoex": load_imoex(report_date),
+            "alert_assessments": assessments,
+            "new_alerts": alert_details(assessments, new, channels.loc[channels["day"].eq(pd.Timestamp(day))]),
+        }
+        log.info("Отчёт за %s рассчитан по %d дням витрины", report_date, len(daily))
+        for section in ("day_metrics", "week_metrics", "factors"):
+            if row[section]["issues"]:
+                log.warning("Отчёт за %s, %s: %s", report_date, section, row[section]["issues"])
+        if by_channel["reason"] == "channel_totals_mismatch":
+            log.warning("Отчёт за %s: итоги по каналам не сходятся с выручкой", report_date)
+        yield row, incidents
 
 
 def _value(value: float | None, kind: str) -> str:
@@ -135,6 +205,41 @@ def format_report(row: dict) -> str:
             f"  Вклад числа платежей: {_value(factors['payment_count_effect'], 'money')}",
             f"  Вклад среднего платежа: {_value(factors['average_payment_effect'], 'money')}",
         ])
+    channel_factors = row.get("channel_factors")
+    if channel_factors is not None:
+        lines.extend(["", "Изменение выручки по каналам привлечения"])
+        reason = channel_factors["reason"]
+        if reason == "incomplete_windows":
+            lines.append("  Недоступно: есть неполное окно.")
+        elif reason == "channel_totals_mismatch":
+            lines.append("  Недоступно: итоги по каналам не сходятся с общей выручкой.")
+        else:
+            for channel in channel_factors["channels"]:
+                lines.append(f"  {channel['channel']}: {_value(channel['delta'], 'money')}")
+            leading = channel_factors["leading"]
+            if leading is not None:
+                lines.append(f"  Наибольший вклад в изменение: {leading['channel']}.")
+                if leading["payment_count_effect"] is None:
+                    lines.append("    В одной из недель у канала не было успешных платежей.")
+                else:
+                    lines.append(f"    Число платежей: {_value(leading['payment_count_effect'], 'money')}")
+                    lines.append(f"    Средний платёж: {_value(leading['average_payment_effect'], 'money')}")
+
+    lines.extend(["", "Бизнес-алёрты"])
+    if not row.get("new_alerts"):
+        lines.append("  Новых алёртов нет.")
+    for alert in row.get("new_alerts", []):
+        metric = alert["metric"]
+        name, kind = (
+            ("Всплеск завершений подписок", "count")
+            if metric == "ended_subscriptions" else METRICS[metric]
+        )
+        observed = int(alert["observed"]) if kind == "count" else alert["observed"]
+        expected = f"{alert['expected']:g}" if kind == "count" else _value(alert["expected"], kind)
+        lines.append(f"  {name}: {_value(observed, kind)}, обычное значение {expected}")
+        if "channel" in alert:
+            lines.append(f"    Ведущий канал: {alert['channel']} ({alert['channel_count']} завершений)")
+
     lines.extend(["", "Рыночный контекст"])
     rate = row.get("cbr_rate")
     if rate is None:

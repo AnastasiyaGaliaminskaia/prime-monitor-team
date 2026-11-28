@@ -10,6 +10,15 @@ FIRST_DAY = date(2025, 1, 6)
 AFTER_LAST_DAY = date(2026, 8, 31)
 
 
+def _payment_quality(daily: pd.DataFrame) -> pd.Series:
+    status = pd.Series("ok", index=daily.index, dtype="str")
+    status.loc[~daily["bad_amounts"].eq(0)] = "invalid_amount"
+    covered = daily["payment_hours"].eq(24) & daily["has_sessions"].eq(True)
+    status.loc[~covered.fillna(False)] = "incomplete_coverage"
+    status.loc[daily["payment_hours"].isna() | daily["payment_hours"].eq(0)] = "no_payments_in_source"
+    return status
+
+
 def load_daily(start: date, end: date, *, subscriptions: bool = False):
     """Вернуть дневную витрину и разбивку завершений за интервал [start, end) UTC."""
     if not FIRST_DAY <= start < end <= AFTER_LAST_DAY:
@@ -61,8 +70,7 @@ def load_daily(start: date, end: date, *, subscriptions: bool = False):
                 ),
                 coverage AS (
                     SELECT CAST(paid_at AS date) AS day,
-                           extract(hour FROM min(paid_at)) AS first_hour,
-                           extract(hour FROM max(paid_at)) AS last_hour
+                           count(DISTINCT extract(hour FROM paid_at)) AS payment_hours
                     FROM prime.payments
                     WHERE paid_at >= :start AND paid_at < :end
                     GROUP BY 1
@@ -133,13 +141,8 @@ def load_daily(start: date, end: date, *, subscriptions: bool = False):
     calendar = pd.date_range(start, pd.Timestamp(end) - pd.Timedelta(days=1), name="day")
     payments["day"] = pd.to_datetime(payments["day"])
     daily = payments.set_index("day").reindex(calendar)
-    # Грубая проверка покрытия всего источника, независимая от объёма личного сегмента.
-    early = daily["first_hour"].le(2)
-    late = daily["last_hour"].ge(22)
-    daily["payment_quality"] = "ok"
-    daily.loc[~daily["bad_amounts"].eq(0), "payment_quality"] = "invalid_amount"
-    daily.loc[~(early & late & daily["has_sessions"].eq(True)), "payment_quality"] = "incomplete_coverage"
-    daily.loc[daily["first_hour"].isna(), "payment_quality"] = "no_payments_in_source"
+    # Проверяем все часы по всему источнику, даже если в сегменте мало платежей.
+    daily["payment_quality"] = _payment_quality(daily)
     daily["payments_complete"] = daily["payment_quality"].eq("ok")
     columns = ["payments_count", "total_revenue", "failed_attempts", "completed_attempts", "new_paying_clients"]
     daily[columns] = daily[columns].fillna(0).where(daily["payments_complete"], axis=0)
@@ -211,3 +214,35 @@ def load_churn_cohorts(
         engine.dispose()
 
     return {(start, end): (active, ended) for start, end, active, ended in rows}
+
+
+def load_payment_channels(start: date, end: date) -> pd.DataFrame:
+    """Вернуть дневную выручку и число успешных платежей по каналам UTC."""
+    if not FIRST_DAY <= start < end <= AFTER_LAST_DAY:
+        raise ValueError("Интервал должен лежать внутри истории ПРАЙМ")
+
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET TIME ZONE 'UTC'"))
+            scope = conn.execute(text(
+                "SELECT client_filter FROM prime.assignments WHERE login = current_user"
+            )).scalar_one()
+            channels = pd.read_sql(text(f"""
+                WITH scoped_clients AS (
+                    SELECT client_id, acquisition_channel FROM prime.clients WHERE ({scope})
+                )
+                SELECT CAST(p.paid_at AS date) AS day,
+                       coalesce(nullif(trim(c.acquisition_channel), ''), 'без канала') AS channel,
+                       count(*) AS payments_count, sum(p.amount) AS total_revenue
+                FROM prime.payments p
+                JOIN prime.subscriptions s USING (subscription_id)
+                JOIN scoped_clients c ON c.client_id = s.owner_client_id
+                WHERE p.paid_at >= :start AND p.paid_at < :end AND p.status = 'success'
+                GROUP BY 1, 2
+            """), conn, params={"start": start, "end": end})
+    finally:
+        engine.dispose()
+
+    channels["day"] = pd.to_datetime(channels["day"])
+    return channels

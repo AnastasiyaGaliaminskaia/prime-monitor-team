@@ -1,4 +1,4 @@
-"""Команда запуска отчёта ПРАЙМ."""
+"""Команды отчёта и повторного прогона ПРАЙМ."""
 
 import argparse
 import logging
@@ -6,7 +6,9 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from .report import build_day, format_report
+from .config import load_replay_start
+from .replay import DEFAULT_STORE, run_backfill, run_next_day
+from .report import ReportDateError, build_day, format_report
 
 log = logging.getLogger("prime")
 
@@ -16,6 +18,10 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     report = commands.add_parser("report", help="отчёт ПРАЙМ за дату")
     report.add_argument("--date", type=date.fromisoformat, required=True, help="ГГГГ-ММ-ДД")
+    commands.add_parser("replay", help="обработать следующую дату отчёта")
+    backfill = commands.add_parser("backfill", help="пересчитать диапазон дат отчёта включительно")
+    backfill.add_argument("--start", type=date.fromisoformat, required=True, help="ГГГГ-ММ-ДД")
+    backfill.add_argument("--end", type=date.fromisoformat, required=True, help="ГГГГ-ММ-ДД")
     args = parser.parse_args()
 
     try:
@@ -27,22 +33,30 @@ def main() -> int:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
-        log.info("Запуск отчёта за %s", args.date)
-        row = build_day(args.date)
-    except ValueError as error:
-        log.error("Некорректный ввод или данные для даты %s", args.date)
-        # Сообщение нашего ограничения диапазона не содержит реквизитов подключения.
-        if str(error).startswith("Дата отчёта вне диапазона"):
-            print(error, file=sys.stderr)
+        log.info("Запуск: %s", args)
+        if args.command == "report":
+            print(format_report(build_day(args.date)))
+        elif args.command == "replay":
+            result = run_next_day(load_replay_start())
+            if result:
+                day, report_text = result
+                log.info("Replay: отчёт сохранён за %s", day)
+                print(report_text)
+            else:
+                print("История ПРАЙМ обработана до конца.")
         else:
-            print("Некорректные данные для расчёта отчёта.", file=sys.stderr)
+            saved = run_backfill(args.start, args.end)
+            log.info("Backfill: сохранено отчётов: %d", saved)
+            print(f"Пересчитано отчётов: {saved}. Результаты сохранены в {DEFAULT_STORE}.")
+    except ReportDateError as error:
+        log.error("%s", error)
+        print(error, file=sys.stderr)
         return 1
     except Exception as error:
-        log.error("Отчёт за %s не построен (%s)", args.date, type(error).__name__)
-        print(f"Не удалось построить отчёт ({type(error).__name__}).", file=sys.stderr)
+        log.error("Команда %s завершилась с ошибкой (%s)", args.command, type(error).__name__)
+        print(f"Не удалось выполнить команду ({type(error).__name__}).", file=sys.stderr)
         return 1
 
-    print(format_report(row))
     return 0
 
 
