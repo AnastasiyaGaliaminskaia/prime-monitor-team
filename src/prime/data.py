@@ -1,7 +1,9 @@
+from datetime import date
 import logging
 import pandas as pd
 from sqlalchemy import text
 from .config import get_engine
+from .market_data import load_cbr_rate
 import os
 
 logger = logging.getLogger(__name__)
@@ -226,51 +228,21 @@ def fetch_daily_payments_by_method(report_date: str) -> pd.DataFrame:
 
 
 
-import requests
-
 def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
-    """
-    Загружает курс доллара к рублю от ЦБ РФ на конкретную дату.
-    Возвращает DataFrame с колонками: date, currency, rate.
-    Если API недоступен, возвращает пустой DataFrame и пишет ошибку в лог.
-    """
-    # Формат даты для API ЦБ РФ: YYYY/MM/DD
-    url = f"https://www.cbr-xml-daily.ru/archive/{report_date.replace('-', '/')}/daily_json.js"
-    
-    logger.info(f"Запрос курса валют ЦБ РФ на дату: {report_date}")
-    
-    try:
-        # Обязательно ставим timeout, чтобы система не зависла, если API упадет!
-        response = requests.get(url, timeout=10)
-        response.raise_for_status() # Вызовет ошибку, если статус 404 или 500
-        
-        data = response.json()
-        
-        # Достаем курс USD (доллара)
-        usd_data = data['Valute'].get('USD')
-        if not usd_data:
-            logger.warning(f"Данные по USD не найдены в ответе API за {report_date}")
-            return pd.DataFrame()
-            
-        # В ответе ЦБ курс умножен на номинал (обычно на 1, но бывает и на 10)
-        nominal = usd_data['Nominal']
-        rate = usd_data['Value'] / nominal
-        
-        df = pd.DataFrame([{
-            "date": report_date,
-            "currency": "USD",
-            "rate": rate
-        }])
-        
-        logger.info(f"Успешно получен курс USD: {rate}")
-        return df
-        
-    except requests.exceptions.RequestException as e:
-        # Если интернета нет или API упал — просто пишем в лог и возвращаем пустоту
-        logger.error(f"Не удалось получить данные от ЦБ РФ за {report_date}: {e}")
-        return pd.DataFrame()
+    """Исторический USD/RUB через официальный API Банка России."""
+    columns = ["date", "currency", "rate", "effective_date"]
+    rate = load_cbr_rate(date.fromisoformat(report_date))
+    if rate is None:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame([{
+        "date": report_date,
+        "currency": "USD",
+        "rate": rate.rubles_per_usd,
+        "effective_date": rate.effective_date.isoformat(),
+    }], columns=columns)
 
-def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, **kwargs) -> pd.DataFrame:
+
+def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, *, cache_empty=True, **kwargs) -> pd.DataFrame:
     """
     Универсальная функция-обертка для кэширования.
     Если файл есть — читает его. Если нет — вызывает fetch_func и сохраняет.
@@ -286,6 +258,8 @@ def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, **kwarg
     # 2. Если файла нет, идем в базу
     logger.info(f"[БАЗА] Файл кэша для {metric_name} за {report_date} не найден. Загружаем...")
     df = fetch_func(report_date, **kwargs)
+    if df.empty and not cache_empty:
+        return df
     
     # 3. Сохраняем в кэш
     os.makedirs("data", exist_ok=True) # Создаем папку, если её нет
@@ -315,4 +289,4 @@ def get_sessions_cached(report_date: str) -> pd.DataFrame:
     return _get_cached_or_fetch(report_date, "sessions", fetch_daily_sessions)
 
 def get_cbr_rate_cached(report_date: str) -> pd.DataFrame:
-    return _get_cached_or_fetch(report_date, "cbr_rate", fetch_cbr_currency_rate)
+    return _get_cached_or_fetch(report_date, "cbr_official_rate", fetch_cbr_currency_rate, cache_empty=False)

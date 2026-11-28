@@ -15,6 +15,9 @@ dependencies = [
     "sqlalchemy>=2.0",
 ]
 
+[project.scripts]
+prime = "prime.cli:main"
+
 [dependency-groups]
 dev = [
     "nbstripout>=0.8",
