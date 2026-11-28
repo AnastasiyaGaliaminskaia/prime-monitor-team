@@ -6,6 +6,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from .aggregate_cache import AggregateCache, CacheRefreshError
 from .config import load_replay_start
 from .replay import DEFAULT_STORE, run_backfill, run_next_day
 from .report import ReportDateError, build_day, format_report
@@ -34,10 +35,11 @@ def main() -> int:
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
         log.info("Запуск: %s", args)
+        cache = AggregateCache()
         if args.command == "report":
-            print(format_report(build_day(args.date)))
+            print(format_report(build_day(args.date, cache=cache)))
         elif args.command == "replay":
-            result = run_next_day(load_replay_start())
+            result = run_next_day(load_replay_start(), cache=cache)
             if result:
                 day, report_text = result
                 log.info("Replay: отчёт сохранён за %s", day)
@@ -45,10 +47,10 @@ def main() -> int:
             else:
                 print("История ПРАЙМ обработана до конца.")
         else:
-            saved = run_backfill(args.start, args.end)
+            saved = run_backfill(args.start, args.end, cache=cache)
             log.info("Backfill: сохранено отчётов: %d", saved)
             print(f"Пересчитано отчётов: {saved}. Результаты сохранены в {DEFAULT_STORE}.")
-    except ReportDateError as error:
+    except (ReportDateError, CacheRefreshError) as error:
         log.error("%s", error)
         print(error, file=sys.stderr)
         return 1

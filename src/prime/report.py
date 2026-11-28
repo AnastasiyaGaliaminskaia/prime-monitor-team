@@ -5,6 +5,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+from .aggregate_cache import AggregateCache
 from .alerts import LOOKBACK_WEEKS, RULES, alert_details, detect_anomalies, update_incidents
 from .analytics_data import AFTER_LAST_DAY, FIRST_DAY, load_churn_cohorts, load_daily, load_payment_channels
 from .factors import channel_revenue_factors, weekly_revenue_factors
@@ -55,13 +56,15 @@ def validate_report_range(start: date, end: date) -> None:
         )
 
 
-def build_day(report_date: date) -> dict:
+def build_day(report_date: date, *, cache: AggregateCache | None = None) -> dict:
     """Собрать отчёт за одну дату без записи состояния."""
-    row, _ = next(iter_reports(report_date, report_date))
+    row, _ = next(iter_reports(report_date, report_date, cache=cache))
     return row
 
 
-def _incidents_before(daily: pd.DataFrame, start: date, end: date) -> set[str]:
+def _incidents_before(
+    daily: pd.DataFrame, start: date, end: date, *, cache: AggregateCache | None = None,
+) -> set[str]:
     """Найти последнее подтверждённое состояние каждого правила до end."""
     open_incidents = set()
     unresolved = set(RULES)
@@ -81,11 +84,13 @@ def _incidents_before(daily: pd.DataFrame, start: date, end: date) -> set[str]:
         end = start
         start = max(FIRST_DAY, end - timedelta(weeks=4))
         history_start = max(FIRST_DAY, start - timedelta(weeks=LOOKBACK_WEEKS))
-        daily, _ = load_daily(history_start, end, subscriptions=True)
+        daily, _ = load_daily(history_start, end, subscriptions=True, cache=cache)
     return open_incidents
 
 
-def iter_reports(start: date, end: date, *, open_incidents: set[str] | None = None):
+def iter_reports(
+    start: date, end: date, *, open_incidents: set[str] | None = None, cache: AggregateCache | None = None,
+):
     """Считать отчёты по датам включительно, загружая витрину за диапазон один раз."""
     validate_report_range(start, end)
     first_event_day = start - timedelta(days=1)
@@ -94,8 +99,8 @@ def iter_reports(start: date, end: date, *, open_incidents: set[str] | None = No
     if open_incidents is not None:
         evaluation_start = first_event_day
     load_start = max(FIRST_DAY, evaluation_start - timedelta(weeks=LOOKBACK_WEEKS))
-    daily, channels = load_daily(load_start, end, subscriptions=True)
-    payments_by_channel = load_payment_channels(max(FIRST_DAY, start - timedelta(days=14)), end)
+    daily, channels = load_daily(load_start, end, subscriptions=True, cache=cache)
+    payments_by_channel = load_payment_channels(max(FIRST_DAY, start - timedelta(days=14)), end, cache=cache)
     dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     periods = list(dict.fromkeys(
         (report_date - timedelta(days=length), report_date)
@@ -103,10 +108,10 @@ def iter_reports(start: date, end: date, *, open_incidents: set[str] | None = No
         for length in (1, 7)
         if report_date - timedelta(days=length) >= FIRST_DAY
     ))
-    cohorts = load_churn_cohorts(periods)
+    cohorts = load_churn_cohorts(periods, cache=cache)
 
     incidents = (
-        _incidents_before(daily, evaluation_start, first_event_day)
+        _incidents_before(daily, evaluation_start, first_event_day, cache=cache)
         if open_incidents is None else open_incidents
     )
 

@@ -1,9 +1,12 @@
 """Дневные агрегаты учебной базы для отчёта и аналитических ноутбуков ПРАЙМ."""
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import date
 
 import pandas as pd
 from sqlalchemy import text
 
+from .aggregate_cache import AggregateCache
 from .config import get_engine
 
 FIRST_DAY = date(2025, 1, 6)
@@ -19,114 +22,134 @@ def _payment_quality(daily: pd.DataFrame) -> pd.Series:
     return status
 
 
-def load_daily(start: date, end: date, *, subscriptions: bool = False):
+@contextmanager
+def _read_aggregates(
+    cache: AggregateCache | None,
+) -> Iterator[Callable[[str, str, dict], pd.DataFrame]]:
+    """Открыть соединение только при первом запросе, которого нет в кэше."""
+    with ExitStack() as stack:
+        conn = None
+
+        def read(name: str, sql: str, params: dict) -> pd.DataFrame:
+            def fetch() -> pd.DataFrame:
+                nonlocal conn
+                if conn is None:
+                    engine = get_engine()
+                    stack.callback(engine.dispose)
+                    conn = stack.enter_context(engine.connect())
+                    conn.execute(text("SET TIME ZONE 'UTC'"))
+                return pd.read_sql(text(sql), conn, params=params)
+
+            return fetch() if cache is None else cache.read(name, params, fetch)
+
+        yield read
+
+
+def load_daily(
+    start: date, end: date, *, subscriptions: bool = False, cache: AggregateCache | None = None,
+):
     """Вернуть дневную витрину и разбивку завершений за интервал [start, end) UTC."""
     if not FIRST_DAY <= start < end <= AFTER_LAST_DAY:
         raise ValueError("Интервал должен лежать внутри истории ПРАЙМ")
     bounds = {"start": start, "end": end}
-    engine = get_engine()
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SET TIME ZONE 'UTC'"))
-            payments = pd.read_sql(text("""
-                WITH daily_payments AS (
-                    SELECT CAST(p.paid_at AS date) AS day,
-                           count(*) FILTER (WHERE p.status = 'success') AS payments_count,
-                           coalesce(sum(p.amount) FILTER (WHERE p.status = 'success'), 0) AS total_revenue,
-                           count(*) FILTER (WHERE p.status = 'failed') AS failed_attempts,
-                           count(*) AS completed_attempts,
-                           count(*) FILTER (
-                               WHERE p.status = 'success' AND (p.amount IS NULL OR p.amount <= 0)
-                           ) AS bad_amounts
-                    FROM prime.payments p
-                    WHERE p.paid_at >= :start AND p.paid_at < :end
-                      AND p.status IN ('success', 'failed', 'refunded')
-                    GROUP BY 1
-                ),
-                first_payers AS (
-                    SELECT s.owner_client_id, min(p.paid_at) AS first_paid_at
-                    FROM prime.payments p
-                    JOIN prime.subscriptions s USING (subscription_id)
-                    WHERE p.status = 'success' AND p.paid_at < :end
-                      AND s.owner_client_id IS NOT NULL
-                    GROUP BY s.owner_client_id
-                    HAVING min(p.paid_at) >= :start
-                ),
-                new_payers AS (
-                    SELECT CAST(first_paid_at AS date) AS day, count(*) AS new_paying_clients
-                    FROM first_payers
-                    GROUP BY 1
-                ),
-                coverage AS (
-                    SELECT CAST(paid_at AS date) AS day,
-                           count(DISTINCT extract(hour FROM paid_at)) AS payment_hours
-                    FROM prime.payments
-                    WHERE paid_at >= :start AND paid_at < :end
-                    GROUP BY 1
-                ),
-                sessions AS (
-                    SELECT DISTINCT CAST(started_at AS date) AS day
-                    FROM prime.service_usage
-                    WHERE started_at >= :start AND started_at < :end
-                )
-                SELECT coverage.*, daily_payments.payments_count, daily_payments.total_revenue,
-                       daily_payments.failed_attempts, daily_payments.completed_attempts,
-                       new_payers.new_paying_clients, coalesce(daily_payments.bad_amounts, 0) AS bad_amounts,
-                       sessions.day IS NOT NULL AS has_sessions
-                FROM coverage
-                LEFT JOIN daily_payments USING (day)
-                LEFT JOIN sessions USING (day)
-                LEFT JOIN new_payers USING (day)
-            """), conn, params=bounds)
+    with _read_aggregates(cache) as read:
+        payments = read("daily_payments", """
+            WITH daily_payments AS (
+                SELECT CAST(p.paid_at AS date) AS day,
+                       count(*) FILTER (WHERE p.status = 'success') AS payments_count,
+                       coalesce(sum(p.amount) FILTER (WHERE p.status = 'success'), 0) AS total_revenue,
+                       count(*) FILTER (WHERE p.status = 'failed') AS failed_attempts,
+                       count(*) AS completed_attempts,
+                       count(*) FILTER (
+                           WHERE p.status = 'success' AND (p.amount IS NULL OR p.amount <= 0)
+                       ) AS bad_amounts
+                FROM prime.payments p
+                WHERE p.paid_at >= :start AND p.paid_at < :end
+                  AND p.status IN ('success', 'failed', 'refunded')
+                GROUP BY 1
+            ),
+            first_payers AS (
+                SELECT s.owner_client_id, min(p.paid_at) AS first_paid_at
+                FROM prime.payments p
+                JOIN prime.subscriptions s USING (subscription_id)
+                WHERE p.status = 'success' AND p.paid_at < :end
+                  AND s.owner_client_id IS NOT NULL
+                GROUP BY s.owner_client_id
+                HAVING min(p.paid_at) >= :start
+            ),
+            new_payers AS (
+                SELECT CAST(first_paid_at AS date) AS day, count(*) AS new_paying_clients
+                FROM first_payers
+                GROUP BY 1
+            ),
+            coverage AS (
+                SELECT CAST(paid_at AS date) AS day,
+                       count(DISTINCT extract(hour FROM paid_at)) AS payment_hours
+                FROM prime.payments
+                WHERE paid_at >= :start AND paid_at < :end
+                GROUP BY 1
+            ),
+            sessions AS (
+                SELECT DISTINCT CAST(started_at AS date) AS day
+                FROM prime.service_usage
+                WHERE started_at >= :start AND started_at < :end
+            )
+            SELECT coverage.*, daily_payments.payments_count, daily_payments.total_revenue,
+                   daily_payments.failed_attempts, daily_payments.completed_attempts,
+                   new_payers.new_paying_clients, coalesce(daily_payments.bad_amounts, 0) AS bad_amounts,
+                   sessions.day IS NOT NULL AS has_sessions
+            FROM coverage
+            LEFT JOIN daily_payments USING (day)
+            LEFT JOIN sessions USING (day)
+            LEFT JOIN new_payers USING (day)
+        """, bounds)
 
-            ended_by_channel = pd.DataFrame(columns=["day", "channel", "ended_subs"])
-            if subscriptions:
-                movements = pd.read_sql(text("""
-                    WITH relevant_subscriptions AS (
-                        SELECT started_at, ended_at
-                        FROM prime.subscriptions
-                        WHERE started_at < :end
-                          AND (ended_at IS NULL OR ended_at >= :start)
-                    ),
-                    baseline AS (
-                        SELECT count(*) AS active_at_start FROM relevant_subscriptions WHERE started_at < :start
-                    ),
-                    starts AS (
-                        SELECT CAST(started_at AS date) AS day, count(*) AS starts
-                        FROM relevant_subscriptions WHERE started_at >= :start AND started_at < :end GROUP BY 1
-                    ),
-                    endings AS (
-                        SELECT CAST(ended_at AS date) AS day, count(*) AS endings
-                        FROM relevant_subscriptions WHERE ended_at >= :start AND ended_at < :end GROUP BY 1
-                    ),
-                    source_end_days AS (
-                        SELECT DISTINCT CAST(ended_at AS date) AS day
-                        FROM prime.subscriptions WHERE ended_at >= :start AND ended_at < :end
-                    )
-                    SELECT CAST(g.day AS date) AS day, baseline.active_at_start,
-                           source_end_days.day IS NOT NULL AS source_has_endings,
-                           coalesce(starts.starts, 0) AS starts, coalesce(endings.endings, 0) AS ended_subs
-                    FROM generate_series(
-                         CAST(:start AS timestamp), CAST(:end AS timestamp) - interval '1 day', interval '1 day'
-                    ) AS g(day)
-                    CROSS JOIN baseline
-                    LEFT JOIN starts ON starts.day = CAST(g.day AS date)
-                    LEFT JOIN endings ON endings.day = CAST(g.day AS date)
-                    LEFT JOIN source_end_days ON source_end_days.day = CAST(g.day AS date)
-                    ORDER BY g.day
-                """), conn, params=bounds)
-                ended_by_channel = pd.read_sql(text("""
-                    SELECT CAST(s.ended_at AS date) AS day,
-                           coalesce(nullif(trim(c.acquisition_channel), ''), 'без канала') AS channel,
-                           count(*) AS ended_subs
-                    FROM prime.subscriptions s
-                    LEFT JOIN prime.clients c ON c.client_id = s.owner_client_id
-                    WHERE s.started_at < :end
-                      AND s.ended_at >= :start AND s.ended_at < :end
-                    GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2
-                """), conn, params=bounds)
-    finally:
-        engine.dispose()
+        ended_by_channel = pd.DataFrame(columns=["day", "channel", "ended_subs"])
+        if subscriptions:
+            movements = read("subscription_movements", """
+                WITH relevant_subscriptions AS (
+                    SELECT started_at, ended_at
+                    FROM prime.subscriptions
+                    WHERE started_at < :end
+                      AND (ended_at IS NULL OR ended_at >= :start)
+                ),
+                baseline AS (
+                    SELECT count(*) AS active_at_start FROM relevant_subscriptions WHERE started_at < :start
+                ),
+                starts AS (
+                    SELECT CAST(started_at AS date) AS day, count(*) AS starts
+                    FROM relevant_subscriptions WHERE started_at >= :start AND started_at < :end GROUP BY 1
+                ),
+                endings AS (
+                    SELECT CAST(ended_at AS date) AS day, count(*) AS endings
+                    FROM relevant_subscriptions WHERE ended_at >= :start AND ended_at < :end GROUP BY 1
+                ),
+                source_end_days AS (
+                    SELECT DISTINCT CAST(ended_at AS date) AS day
+                    FROM prime.subscriptions WHERE ended_at >= :start AND ended_at < :end
+                )
+                SELECT CAST(g.day AS date) AS day, baseline.active_at_start,
+                       source_end_days.day IS NOT NULL AS source_has_endings,
+                       coalesce(starts.starts, 0) AS starts, coalesce(endings.endings, 0) AS ended_subs
+                FROM generate_series(
+                     CAST(:start AS timestamp), CAST(:end AS timestamp) - interval '1 day', interval '1 day'
+                ) AS g(day)
+                CROSS JOIN baseline
+                LEFT JOIN starts ON starts.day = CAST(g.day AS date)
+                LEFT JOIN endings ON endings.day = CAST(g.day AS date)
+                LEFT JOIN source_end_days ON source_end_days.day = CAST(g.day AS date)
+                ORDER BY g.day
+            """, bounds)
+            ended_by_channel = read("subscription_endings_by_channel", """
+                SELECT CAST(s.ended_at AS date) AS day,
+                       coalesce(nullif(trim(c.acquisition_channel), ''), 'без канала') AS channel,
+                       count(*) AS ended_subs
+                FROM prime.subscriptions s
+                LEFT JOIN prime.clients c ON c.client_id = s.owner_client_id
+                WHERE s.started_at < :end
+                  AND s.ended_at >= :start AND s.ended_at < :end
+                GROUP BY 1, 2 ORDER BY 1, 3 DESC, 2
+            """, bounds)
 
     calendar = pd.date_range(start, pd.Timestamp(end) - pd.Timedelta(days=1), name="day")
     payments["day"] = pd.to_datetime(payments["day"])
@@ -157,7 +180,7 @@ def load_daily(start: date, end: date, *, subscriptions: bool = False):
 
 
 def load_churn_cohorts(
-    periods: list[tuple[date, date]],
+    periods: list[tuple[date, date]], *, cache: AggregateCache | None = None,
 ) -> dict[tuple[date, date], tuple[int, int]]:
     """Посчитать стартовую когорту и её завершения для каждого периода UTC."""
     if not periods:
@@ -166,60 +189,52 @@ def load_churn_cohorts(
         raise ValueError("Интервал должен лежать внутри истории ПРАЙМ")
 
     starts, ends = zip(*dict.fromkeys(periods))
-    engine = get_engine()
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SET TIME ZONE 'UTC'"))
-            rows = conn.execute(text("""
-                WITH periods AS (
-                    SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[]))
-                    AS bounds(start_day, end_day)
-                ),
-                relevant_subscriptions AS (
-                    SELECT s.started_at, s.ended_at
-                    FROM prime.subscriptions s
-                    WHERE s.started_at < :latest_start
-                      AND (s.ended_at IS NULL OR s.ended_at >= :earliest_start)
-                )
-                SELECT p.start_day, p.end_day, count(s.started_at),
-                       count(*) FILTER (WHERE s.ended_at < p.end_day)
-                FROM periods p
-                LEFT JOIN relevant_subscriptions s ON s.started_at < p.start_day
-                    AND (s.ended_at IS NULL OR s.ended_at >= p.start_day)
-                GROUP BY p.start_day, p.end_day
-            """), {
-                "starts": list(starts),
-                "ends": list(ends),
-                "latest_start": max(starts),
-                "earliest_start": min(starts),
-            }).all()
-    finally:
-        engine.dispose()
+    with _read_aggregates(cache) as read:
+        rows = read("churn_cohorts", """
+            WITH periods AS (
+                SELECT * FROM unnest(CAST(:starts AS date[]), CAST(:ends AS date[]))
+                AS bounds(start_day, end_day)
+            ),
+            relevant_subscriptions AS (
+                SELECT s.started_at, s.ended_at
+                FROM prime.subscriptions s
+                WHERE s.started_at < :latest_start
+                  AND (s.ended_at IS NULL OR s.ended_at >= :earliest_start)
+            )
+            SELECT p.start_day, p.end_day, count(s.started_at) AS active,
+                   count(*) FILTER (WHERE s.ended_at < p.end_day) AS ended
+            FROM periods p
+            LEFT JOIN relevant_subscriptions s ON s.started_at < p.start_day
+                AND (s.ended_at IS NULL OR s.ended_at >= p.start_day)
+            GROUP BY p.start_day, p.end_day
+        """, {
+            "starts": list(starts),
+            "ends": list(ends),
+            "latest_start": max(starts),
+            "earliest_start": min(starts),
+        })
 
-    return {(start, end): (active, ended) for start, end, active, ended in rows}
+    return {(start, end): (active, ended) for start, end, active, ended in rows.itertuples(index=False, name=None)}
 
 
-def load_payment_channels(start: date, end: date) -> pd.DataFrame:
+def load_payment_channels(
+    start: date, end: date, *, cache: AggregateCache | None = None,
+) -> pd.DataFrame:
     """Вернуть дневную выручку и число успешных платежей по каналам UTC."""
     if not FIRST_DAY <= start < end <= AFTER_LAST_DAY:
         raise ValueError("Интервал должен лежать внутри истории ПРАЙМ")
 
-    engine = get_engine()
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SET TIME ZONE 'UTC'"))
-            channels = pd.read_sql(text("""
-                SELECT CAST(p.paid_at AS date) AS day,
-                       coalesce(nullif(trim(c.acquisition_channel), ''), 'без канала') AS channel,
-                       count(*) AS payments_count, sum(p.amount) AS total_revenue
-                FROM prime.payments p
-                LEFT JOIN prime.subscriptions s USING (subscription_id)
-                LEFT JOIN prime.clients c ON c.client_id = s.owner_client_id
-                WHERE p.paid_at >= :start AND p.paid_at < :end AND p.status = 'success'
-                GROUP BY 1, 2
-            """), conn, params={"start": start, "end": end})
-    finally:
-        engine.dispose()
+    with _read_aggregates(cache) as read:
+        channels = read("payments_by_channel", """
+            SELECT CAST(p.paid_at AS date) AS day,
+                   coalesce(nullif(trim(c.acquisition_channel), ''), 'без канала') AS channel,
+                   count(*) AS payments_count, sum(p.amount) AS total_revenue
+            FROM prime.payments p
+            LEFT JOIN prime.subscriptions s USING (subscription_id)
+            LEFT JOIN prime.clients c ON c.client_id = s.owner_client_id
+            WHERE p.paid_at >= :start AND p.paid_at < :end AND p.status = 'success'
+            GROUP BY 1, 2
+        """, {"start": start, "end": end})
 
     channels["day"] = pd.to_datetime(channels["day"])
     return channels
