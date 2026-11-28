@@ -1,231 +1,185 @@
 from datetime import date
 import logging
+import os
+import uuid
+from pathlib import Path
+
 import pandas as pd
+import requests
 from sqlalchemy import text
+
 from .config import get_engine
 from .market_data import load_cbr_rate
 import os
 
 logger = logging.getLogger(__name__)
 
+# Версия кеша намеренно изменена: старые файлы содержат результаты
+# с CLIENT_FILTER и не должны использоваться в глобальной аналитике.
+CACHE_DIR = Path("data")
+CACHE_VERSION = "global_v2"
 
-def _get_base_filter() -> str:
-   
+
+def _read_sql(query: str, report_date: str) -> pd.DataFrame:
+    """Выполняет параметризованный запрос за дату в часовом поясе UTC."""
     engine = get_engine()
-    query = text("SELECT client_filter FROM prime.assignments WHERE login = current_user")
-    
+
     try:
         with engine.connect() as conn:
-            result = conn.execute(query).fetchone()
-            if result:
-                return result[0]
-            else:
-                raise ValueError("Не удалось получить фильтр клиентов для текущего пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка при получении базового фильтра: {e}")
+            conn.execute(text("SET TIME ZONE 'UTC'"))
+            return pd.read_sql(
+                text(query),
+                conn,
+                params={"date": report_date},
+            )
+    except Exception:
+        logger.exception("Ошибка SQL-загрузки за %s", report_date)
         raise
 
 
 def fetch_daily_revenue(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    # Мы используем :date как параметр запроса
-    query = text(f"""
-        SELECT 
-            DATE(p.paid_at) as payment_date,
-            COUNT(p.payment_id) as payments_count,
-            SUM(p.amount) as total_revenue
-        FROM prime.payments p
-        JOIN prime.subscriptions s ON s.subscription_id = p.subscription_id
-        WHERE s.owner_client_id IN (SELECT client_id FROM prime.clients WHERE {base_filter})
-          AND p.status = 'success'
-          AND DATE(p.paid_at) = :date
-        GROUP BY DATE(p.paid_at)
-    """)
-    
-    logger.info(f"Загрузка выручки за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            # Устанавливаем часовой пояс, как в вашем ноутбуке
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке выручки за {report_date}: {e}")
-        raise
+    """Глобальная дневная выручка и количество успешных платежей."""
+    query = """
+        SELECT
+            CAST(p.paid_at AS DATE) AS payment_date,
+            COUNT(p.payment_id) AS payments_count,
+            SUM(p.amount) AS total_revenue
+        FROM prime.payments AS p
+        JOIN prime.subscriptions AS s
+            ON s.subscription_id = p.subscription_id
+        WHERE p.status = 'success'
+          AND p.paid_at >= CAST(:date AS DATE)
+          AND p.paid_at < CAST(:date AS DATE) + INTERVAL '1 day'
+        GROUP BY CAST(p.paid_at AS DATE)
+    """
+    logger.info("Загрузка глобальной выручки за %s", report_date)
+    return _read_sql(query, report_date)
 
 
 def fetch_daily_new_clients(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    query = text(f"""
-        SELECT 
-            DATE(registered_at) as registration_date,
-            COUNT(client_id) as new_clients_count
+    """Глобальное количество новых клиентов за день."""
+    query = """
+        SELECT
+            CAST(registered_at AS DATE) AS registration_date,
+            COUNT(client_id) AS new_clients_count
         FROM prime.clients
-        WHERE {base_filter}
-          AND DATE(registered_at) = :date
-        GROUP BY DATE(registered_at)
-    """)
-    
-    logger.info(f"Загрузка новых клиентов за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке новых клиентов за {report_date}: {e}")
-        raise
+        WHERE registered_at >= CAST(:date AS DATE)
+          AND registered_at < CAST(:date AS DATE) + INTERVAL '1 day'
+        GROUP BY CAST(registered_at AS DATE)
+    """
+    logger.info("Загрузка глобальных новых клиентов за %s", report_date)
+    return _read_sql(query, report_date)
+
+
+def fetch_new_clients(report_date: str) -> pd.DataFrame:
+    """
+    Совместимость со старым именем функции.
+    Возвращает колонку new_clients, как в прежней реализации.
+    """
+    df = fetch_daily_new_clients(report_date)
+    if "new_clients_count" in df.columns:
+        return df.rename(columns={"new_clients_count": "new_clients"})
+    return df.rename(columns={"new_clients_count": "new_clients"})
 
 
 def fetch_daily_sessions(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    query = text(f"""
-        SELECT 
-            DATE(started_at) as session_date,
-            COUNT(*) as sessions_count
+    """Глобальное количество сессий за день."""
+    query = """
+        SELECT
+            CAST(started_at AS DATE) AS session_date,
+            COUNT(*) AS sessions_count
         FROM prime.service_usage
-        WHERE {base_filter}
-          AND DATE(started_at) = :date
-        GROUP BY DATE(started_at)
-    """)
-    
-    logger.info(f"Загрузка сессий за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке сессий за {report_date}: {e}")
-        raise
-
+        WHERE started_at >= CAST(:date AS DATE)
+          AND started_at < CAST(:date AS DATE) + INTERVAL '1 day'
+        GROUP BY CAST(started_at AS DATE)
+    """
+    logger.info("Загрузка глобальных сессий за %s", report_date)
+    return _read_sql(query, report_date)
 
 
 
 def fetch_active_subscriptions(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    # Мы прибавляем 1 день к report_date, чтобы включить сам день отчета.
-    # Например, если отчет за 24 августа, мы смотрим подписки, активные на 25 августа 00:00.
-    query = text(f"""
+    """Глобальное количество подписок, активных хотя бы часть дня."""
+
+    query = """
         SELECT
-    CAST(:date AS DATE) as report_date,
-    COUNT(subscription_id) as active_subs
-FROM prime.subscriptions
-WHERE owner_client_id IN (SELECT client_id FROM prime.clients WHERE {base_filter})
-  AND CAST(started_at AS DATE) < CAST(:date AS DATE) + INTERVAL '1 day'
-  AND (ended_at IS NULL OR CAST(ended_at AS DATE) >= CAST(:date AS DATE))
-    """)
-    
-    logger.info(f"Загрузка активных подписок на дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке активных подписок на {report_date}: {e}")
-        raise
+            CAST(:date AS DATE) AS report_date,
+            COUNT(subscription_id) AS active_subs
+        FROM prime.subscriptions
+        WHERE started_at < CAST(:date AS DATE) + INTERVAL '1 day'
+          AND (
+                ended_at IS NULL
+                OR ended_at >= CAST(:date AS DATE)
+          )
+    """
+
+    logger.info(
+        "Загрузка глобальных активных подписок за %s",
+        report_date
+    )
+
+    return _read_sql(query, report_date)
+
 
 
 def fetch_churn(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    query = text(f"""
-        SELECT 
-            CAST(ended_at AS DATE) as churn_date,
-            COUNT(subscription_id) as churned_subs
+    """Глобальное количество отмен за день; сохраняет прежнюю форму результата."""
+    query = """
+        SELECT
+            CAST(ended_at AS DATE) AS churn_date,
+            COUNT(DISTINCT subscription_id) AS churned_subs
         FROM prime.subscriptions
-        WHERE owner_client_id IN (SELECT client_id FROM prime.clients WHERE {base_filter})
-          AND CAST(ended_at AS DATE) = CAST(:date AS DATE)
-        GROUP BY CAST(ended_at AS DATE)  
-    """)
-    
-    logger.info(f"Загрузка оттока за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке оттока за {report_date}: {e}")
-        raise
+        WHERE ended_at >= CAST(:date AS DATE)
+          AND ended_at < CAST(:date AS DATE) + INTERVAL '1 day'
+        GROUP BY CAST(ended_at AS DATE)
+    """
+    logger.info("Загрузка глобального оттока за %s", report_date)
+    return _read_sql(query, report_date)
 
 
-def fetch_new_clients(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    query = text(f"""
-        SELECT 
-            CAST(registered_at AS DATE) as registration_date,
-            COUNT(client_id) as new_clients
-        FROM prime.clients
-        WHERE {base_filter}
-          AND CAST(registered_at AS DATE) = CAST(:date AS DATE)
-        GROUP BY CAST(registered_at AS DATE)
-    """)
-    
-    logger.info(f"Загрузка новых клиентов за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке новых клиентов за {report_date}: {e}")
-        raise
+def fetch_churn_by_channel(report_date: str) -> pd.DataFrame:
+    """
+    Глобальный отток по каналам привлечения.
+    NULL-каналы сохраняются как отдельная категория.
+    """
+    query = """
+        SELECT
+            CAST(s.ended_at AS DATE) AS churn_date,
+            COALESCE(c.acquisition_channel, 'без канала')
+                AS acquisition_channel,
+            COUNT(DISTINCT s.subscription_id) AS churned_subs
+        FROM prime.subscriptions AS s
+        JOIN prime.clients AS c
+            ON c.client_id = s.owner_client_id
+        WHERE s.ended_at >= CAST(:date AS DATE)
+          AND s.ended_at < CAST(:date AS DATE) + INTERVAL '1 day'
+        GROUP BY
+            CAST(s.ended_at AS DATE),
+            COALESCE(c.acquisition_channel, 'без канала')
+        ORDER BY churned_subs DESC
+    """
+    logger.info("Загрузка глобального оттока по каналам за %s", report_date)
+    return _read_sql(query, report_date)
 
 
 def fetch_daily_payments_by_method(report_date: str) -> pd.DataFrame:
-    
-    engine = get_engine()
-    base_filter = _get_base_filter()
-    
-    query = text(f"""
-        SELECT 
+    """Глобальные успешные платежи в разрезе метода оплаты."""
+    query = """
+        SELECT
             p.payment_method,
-            COUNT(p.payment_id) as payments_count,
-            SUM(p.amount) as total_amount
-        FROM prime.payments p
-        JOIN prime.subscriptions s ON s.subscription_id = p.subscription_id
-        WHERE s.owner_client_id IN (SELECT client_id FROM prime.clients WHERE {base_filter})
-          AND p.status = 'success'
-          AND CAST(p.paid_at AS DATE) = CAST(:date AS DATE)
+            COUNT(p.payment_id) AS payments_count,
+            SUM(p.amount) AS total_amount
+        FROM prime.payments AS p
+        JOIN prime.subscriptions AS s
+            ON s.subscription_id = p.subscription_id
+        WHERE p.status = 'success'
+          AND p.paid_at >= CAST(:date AS DATE)
+          AND p.paid_at < CAST(:date AS DATE) + INTERVAL '1 day'
         GROUP BY p.payment_method
-    """)
-    
-    logger.info(f"Загрузка платежей по методам за дату: {report_date}")
-    
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("set time zone 'UTC'"))
-            df = pd.read_sql(query, conn, params={"date": report_date})
-            return df
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке платежей по методам за {report_date}: {e}")
-        raise
-
+        ORDER BY total_amount DESC
+    """
+    logger.info("Загрузка глобальных платежей по методам за %s", report_date)
+    return _read_sql(query, report_date)
 
 
 def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
@@ -244,49 +198,81 @@ def fetch_cbr_currency_rate(report_date: str) -> pd.DataFrame:
 
 def _get_cached_or_fetch(report_date: str, metric_name: str, fetch_func, *, cache_empty=True, **kwargs) -> pd.DataFrame:
     """
-    Универсальная функция-обертка для кэширования.
-    Если файл есть — читает его. Если нет — вызывает fetch_func и сохраняет.
+    Читает или создаёт дневной Parquet-кеш.
+
+    В имени файла есть версия global_v2, поэтому старые кеши,
+    созданные с CLIENT_FILTER, не будут случайно использованы.
+    Запись сначала идёт во временный файл, затем атомарно переименовывается.
     """
-    # Формируем путь: data/revenue_2026-08-03.parquet
-    file_path = f"data/{metric_name}_{report_date}.parquet"
-    
-    # 1. Проверяем кэш
-    if os.path.exists(file_path):
-        logger.info(f"[КЭШ] Чтение {metric_name} за {report_date} из файла")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = CACHE_DIR / (
+        f"{CACHE_VERSION}_{metric_name}_{report_date}.parquet"
+    )
+
+    if file_path.exists():
+        logger.info("[CACHE] Чтение %s", file_path)
         return pd.read_parquet(file_path)
-        
-    # 2. Если файла нет, идем в базу
-    logger.info(f"[БАЗА] Файл кэша для {metric_name} за {report_date} не найден. Загружаем...")
+
+    logger.info("[DB] Загрузка %s за %s", metric_name, report_date)
     df = fetch_func(report_date, **kwargs)
     if df.empty and not cache_empty:
         return df
     
     # 3. Сохраняем в кэш
-    os.makedirs("data", exist_ok=True) # Создаем папку, если её нет
-    df.to_parquet(file_path, index=False)
-    logger.info(f"[КЭШ] Данные сохранены в {file_path}")
-    
+    temp_path = CACHE_DIR / (
+        f".{CACHE_VERSION}_{metric_name}_{report_date}_"
+        f"{uuid.uuid4().hex}.tmp.parquet"
+    )
+
+    try:
+        df.to_parquet(temp_path, index=False)
+        os.replace(temp_path, file_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    logger.info("[CACHE] Сохранено %s", file_path)
+
     return df
 
-
-
-
-#Андрей, это тебе
+# Публичные функции кеширования — сохраняют привычные имена,
+# чтобы не пришлось менять импорты в остальных модулях проекта.
 
 def get_daily_revenue_cached(report_date: str) -> pd.DataFrame:
     return _get_cached_or_fetch(report_date, "revenue", fetch_daily_revenue)
 
+
 def get_active_subscriptions_cached(report_date: str) -> pd.DataFrame:
-    return _get_cached_or_fetch(report_date, "active_subs", fetch_active_subscriptions)
+    return _get_cached_or_fetch(
+        report_date, "active_subs", fetch_active_subscriptions
+    )
+
 
 def get_churn_cached(report_date: str) -> pd.DataFrame:
     return _get_cached_or_fetch(report_date, "churn", fetch_churn)
 
+
+def get_churn_by_channel_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(
+        report_date, "churn_by_channel", fetch_churn_by_channel
+    )
+
+
 def get_new_clients_cached(report_date: str) -> pd.DataFrame:
     return _get_cached_or_fetch(report_date, "new_clients", fetch_new_clients)
-    
+
+
 def get_sessions_cached(report_date: str) -> pd.DataFrame:
-    return _get_cached_or_fetch(report_date, "sessions", fetch_daily_sessions)
+    return _get_cached_or_fetch(
+        report_date, "sessions", fetch_daily_sessions
+    )
+
+
+def get_daily_payments_by_method_cached(report_date: str) -> pd.DataFrame:
+    return _get_cached_or_fetch(
+        report_date, "payments_by_method", fetch_daily_payments_by_method
+    )
+
 
 def get_cbr_rate_cached(report_date: str) -> pd.DataFrame:
     return _get_cached_or_fetch(report_date, "cbr_official_rate", fetch_cbr_currency_rate, cache_empty=False)
